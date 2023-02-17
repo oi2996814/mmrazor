@@ -6,10 +6,12 @@ from types import MethodType
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from mmcv import digit_version
 from mmcv.runner import BaseModule
 from ordered_set import OrderedSet
+from torch.nn.modules import GroupNorm
 from torch.nn.modules.batchnorm import _BatchNorm
+from torch.nn.modules.instancenorm import _InstanceNorm
 
 from mmrazor.models.builder import PRUNERS
 from .utils import SwitchableBatchNorm2d
@@ -20,14 +22,13 @@ CONV = ('ThnnConv2DBackward', 'CudnnConvolutionBackward',
 FC = ('ThAddmmBackward', 'AddmmBackward', 'MmBackward')
 BN = ('ThnnBatchNormBackward', 'CudnnBatchNormBackward',
       'NativeBatchNormBackward')
+GN = ('NativeGroupNormBackward', )
 CONCAT = ('CatBackward', )
 # the modules which contains NON_PASS grad_fn need to change the parameter size
 # according to channels after pruning
 NON_PASS = CONV + FC
-NON_PASS_MODULE = (nn.Conv2d, nn.Linear)
-
-PASS = BN
-PASS_MODULE = (_BatchNorm)
+PASS = BN + GN
+NORM = BN + GN
 
 BACKWARD_PARSER_DICT = dict()
 MAKE_GROUP_PARSER_DICT = dict()
@@ -89,6 +90,20 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         else:
             self.except_start_keys = except_start_keys
 
+    def trace_shared_module_hook(self, module, inputs, outputs):
+        """Trace shared modules. Modules such as the detection head in
+        RetinaNet which are visited more than once during :func:`forward` are
+        shared modules.
+
+        Args:
+            module (:obj:`torch.nn.Module`): The module to register hook.
+            inputs (tuple): The input of the module.
+            outputs (tuple): The output of the module.
+        """
+        module.cnt += 1
+        if module.cnt == 2:
+            self.shared_module.append(self.module2name[module])
+
     def prepare_from_supernet(self, supernet):
         """Prepare for pruning."""
 
@@ -98,9 +113,32 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
 
         # record the visited module name during trace path
         visited = dict()
+        # Record shared modules which will be visited more than once during
+        # forward such as shared detection head in RetinaNet.
+        # If a module is not a shared module and it has been visited during
+        # forward, its parent modules must have been traced already.
+        # However, a shared module will be visited more than once during
+        # forward, so it is still need to be traced even if it has been
+        # visited.
+        self.shared_module = []
+        tmp_shared_module_hook_handles = list()
 
         for name, module in supernet.model.named_modules():
+            if isinstance(module, nn.GroupNorm):
+                min_required_version = '1.6.0'
+                assert digit_version(
+                    torch.__version__
+                ) >= digit_version(min_required_version), (
+                    f'Requires pytorch>={min_required_version} to auto-trace'
+                    f'GroupNorm correctly.')
             if hasattr(module, 'weight'):
+                # trace shared modules
+                module.cnt = 0
+                # the handle is only to remove the corresponding hook later
+                handle = module.register_forward_hook(
+                    self.trace_shared_module_hook)
+                tmp_shared_module_hook_handles.append(handle)
+
                 module2name[module] = name
                 name2module[name] = module
                 var2module[id(module.weight)] = module
@@ -109,21 +147,44 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
             if isinstance(module, SwitchableBatchNorm2d):
                 name2module[name] = module
         self.name2module = name2module
+        self.module2name = module2name
+
+        # Set requires_grad to True. If the `requires_grad` of a module's
+        # weight is False, we can not trace this module by parsing backward.
+        param_require_grad = dict()
+        for param in supernet.model.parameters():
+            param_require_grad[id(param)] = param.requires_grad
+            param.requires_grad = True
 
         pseudo_img = torch.randn(1, 3, 224, 224)
         # todo: support two stage detector and mmseg
         pseudo_img = supernet.forward_dummy(pseudo_img)
         pseudo_loss = supernet.cal_pseudo_loss(pseudo_img)
 
+        # `trace_shared_module_hook` and `cnt` are only used to trace the
+        # shared modules in a model and need to be remove later
+        for name, module in supernet.model.named_modules():
+            if hasattr(module, 'weight'):
+                del module.cnt
+
+        for handle in tmp_shared_module_hook_handles:
+            handle.remove()
+
+        # We set requires_grad to True to trace the whole architecture
+        # topology. So it should be reset after that.
+        for param in supernet.model.parameters():
+            param.requires_grad = param_require_grad[id(param)]
+        del param_require_grad
+
         non_pass_paths = list()
         cur_non_pass_path = list()
         self.trace_non_pass_path(pseudo_loss.grad_fn, module2name, var2module,
                                  cur_non_pass_path, non_pass_paths, visited)
 
-        bn_conv_links = dict()
-        self.trace_bn_conv_links(pseudo_loss.grad_fn, module2name, var2module,
-                                 bn_conv_links, visited)
-        self.bn_conv_links = bn_conv_links
+        norm_conv_links = dict()
+        self.trace_norm_conv_links(pseudo_loss.grad_fn, module2name,
+                                   var2module, norm_conv_links, visited)
+        self.norm_conv_links = norm_conv_links
 
         # a node can be the name of a conv module or a str like 'concat_{id}'
         node2parents = self.find_node_parents(non_pass_paths)
@@ -150,6 +211,8 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
                     self.modules_have_child.add(name)
 
         self.channel_spaces = self.build_channel_spaces(name2module)
+
+        self._reset_norm_running_stats(supernet)
 
     @abstractmethod
     def sample_subnet(self):
@@ -214,12 +277,12 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
             module = self.name2module[module_name]
             module.out_mask = subnet_dict[space_id].to(module.out_mask.device)
 
-        for bn, conv in self.bn_conv_links.items():
-            module = self.name2module[bn]
+        for norm, conv in self.norm_conv_links.items():
+            module = self.name2module[norm]
             conv_space_id = self.get_space_id(conv)
             # conv_space_id is None means the conv layer in front of
-            # this bn module can not be pruned. So we should not set
-            # the out_mask of this bn layer
+            # this normalization module can not be pruned. So we should not set
+            # the out_mask of this normalization layer
             if conv_space_id is not None:
                 module.out_mask = subnet_dict[conv_space_id].to(
                     module.out_mask.device)
@@ -291,6 +354,8 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         elif (node_name in name2module
               and isinstance(name2module[node_name], nn.Conv2d)
               and name2module[node_name].in_channels
+              == name2module[node_name].out_channels
+              and name2module[node_name].in_channels
               == name2module[node_name].groups):
             return MAKE_GROUP_PARSER_DICT['depthwise']
         else:
@@ -345,13 +410,14 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         same_in_channel_groups, same_out_channel_groups = {}, {}
         for node_name, parents_name in node2parents.items():
             parser = self.find_make_group_parser(node_name, name2module)
-            idx, same_in_channel_groups, same_out_channel_groups = \
-                parser(self,
-                       node_name=node_name,
-                       parents_name=parents_name,
-                       group_idx=idx,
-                       same_in_channel_groups=same_in_channel_groups,
-                       same_out_channel_groups=same_out_channel_groups)
+            idx, same_in_channel_groups, same_out_channel_groups = parser(
+                self,
+                node_name=node_name,
+                parents_name=parents_name,
+                group_idx=idx,
+                same_in_channel_groups=same_in_channel_groups,
+                same_out_channel_groups=same_out_channel_groups,
+            )
 
         groups = dict()
         idx = 0
@@ -366,47 +432,56 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
     @staticmethod
     def modify_conv_forward(module):
         """Modify the forward method of a conv layer."""
+        original_forward = module.forward
 
         def modified_forward(self, feature):
             feature = feature * self.in_mask
-            return F.conv2d(feature, self.weight, self.bias, self.stride,
-                            self.padding, self.dilation, self.groups)
+            return original_forward(feature)
 
         return MethodType(modified_forward, module)
 
     @staticmethod
     def modify_fc_forward(module):
         """Modify the forward method of a linear layer."""
+        original_forward = module.forward
 
         def modified_forward(self, feature):
             if not len(self.in_mask.shape) == len(self.out_mask.shape):
                 self.in_mask = self.in_mask.reshape(self.in_mask.shape[:2])
 
             feature = feature * self.in_mask
-            return F.linear(feature, self.weight, self.bias)
+            return original_forward(feature)
 
         return MethodType(modified_forward, module)
 
     def add_pruning_attrs(self, module):
         """Add masks to a ``nn.Module``."""
-        if type(module).__name__ == 'Conv2d':
+        if isinstance(module, nn.Conv2d):
             module.register_buffer(
                 'in_mask',
-                module.weight.new_ones((1, module.in_channels, 1, 1), ))
+                module.weight.new_ones((1, module.in_channels, 1, 1), ),
+            )
             module.register_buffer(
                 'out_mask',
-                module.weight.new_ones((1, module.out_channels, 1, 1), ))
+                module.weight.new_ones((1, module.out_channels, 1, 1), ),
+            )
             module.forward = self.modify_conv_forward(module)
-        if type(module).__name__ == 'Linear':
+        if isinstance(module, nn.Linear):
             module.register_buffer(
-                'in_mask', module.weight.new_ones((1, module.in_features), ))
-            module.register_buffer(
-                'out_mask', module.weight.new_ones((1, module.out_features), ))
-            module.forward = self.modify_fc_forward(module)
-        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                'in_mask',
+                module.weight.new_ones((1, module.in_features), ),
+            )
             module.register_buffer(
                 'out_mask',
-                module.weight.new_ones((1, len(module.weight), 1, 1), ))
+                module.weight.new_ones((1, module.out_features), ),
+            )
+            module.forward = self.modify_fc_forward(module)
+        if isinstance(module, _BatchNorm) or isinstance(
+                module, _InstanceNorm) or isinstance(module, GroupNorm):
+            module.register_buffer(
+                'out_mask',
+                module.weight.new_ones((1, len(module.weight), 1, 1), ),
+            )
 
     def find_node_parents(self, paths):
         """Find the parent node of a node.
@@ -480,14 +555,16 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
                 module.out_channels = out_channels
             if hasattr(module, 'out_features'):
                 module.out_features = out_channels
+            if hasattr(module, 'num_features'):
+                module.num_features = out_channels
             if hasattr(module, 'out_mask'):
                 module.out_mask = module.out_mask[:, :out_channels]
 
             if 'in_channels' in channels_per_layer:
                 in_channels = channels_per_layer['in_channels']
 
-                if in_channels > 1:
-                    temp_weight = temp_weight[:, :in_channels].data
+                # can also handle depthwise conv
+                temp_weight = temp_weight[:, :in_channels].data
                 if hasattr(module, 'in_channels'):
                     module.in_channels = in_channels
                 if hasattr(module, 'in_features'):
@@ -498,11 +575,12 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
                 if getattr(module, 'groups', in_channels) > 1:
                     module.groups = in_channels
 
-            module.weight = nn.Parameter(temp_weight.data)
+            module.weight = nn.Parameter(temp_weight.data.clone())
             module.weight.requires_grad = requires_grad
 
             if hasattr(module, 'bias') and module.bias is not None:
-                module.bias = nn.Parameter(module.bias.data[:out_channels])
+                module.bias = nn.Parameter(
+                    module.bias.data[:out_channels].clone())
                 module.bias.requires_grad = requires_grad
 
             if hasattr(module, 'running_mean'):
@@ -568,15 +646,18 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         else:
             result_paths.append(copy.deepcopy(cur_path))
 
-    def trace_bn_conv_links(self, grad_fn, module2name, var2module,
-                            bn_conv_links, visited):
-        """Get the convolutional layer placed before a bn layer in the model.
+    def trace_norm_conv_links(self, grad_fn, module2name, var2module,
+                              norm_conv_links, visited):
+        """Get the convolutional layer placed before a normalization layer in
+        the model.
 
         Example:
             >>> conv = nn.Conv2d(3, 3, 3)
-            >>> bn = nn.BatchNorm2d(3)
+            >>> norm = nn.BatchNorm2d(3)
             >>> pseudo_img = torch.rand(1, 3, 224, 224)
-            >>> out = bn(conv(pseudo_img))
+            >>> out = norm(conv(pseudo_img))
+            >>> print(out.grad_fn)
+            <NativeBatchNormBackward object at 0x0000022BC709DB08>
             >>> print(out.grad_fn.next_functions)
             ((<ThnnConv2DBackward object at 0x0000020E40639688>, 0),
             (<AccumulateGrad object at 0x0000020E40639208>, 0),
@@ -584,23 +665,60 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
             >>> # op.next_functions[0][0] is ThnnConv2DBackward means
             >>> # the parent of this NativeBatchNormBackward op is
             >>> # ThnnConv2DBackward
-            >>> # op.next_functions[1][0].variable is the weight of this bn
-            >>> # module
-            >>> # op.next_functions[2][0].variable is the bias of this bn
-            >>> # module
+            >>> # op.next_functions[1][0].variable is the weight of this
+            >>> # normalization module
+            >>> # op.next_functions[2][0].variable is the bias of this
+            >>> # normalization module
+
+            >>> # Things are different in InstanceNorm
+            >>> conv = nn.Conv2d(3, 3, 3)
+            >>> norm = nn.InstanceNorm2d(3, affine=True)
+            >>> out = norm(conv(pseudo_img))
+            >>> print(out.grad_fn)
+            <ViewBackward object at 0x0000022BC709DD48>
+            >>> print(out.grad_fn.next_functions)
+            ((<NativeBatchNormBackward object at 0x0000022BC81E8A08>, 0),)
+            >>> print(out.grad_fn.next_functions[0][0].next_functions)
+            ((<ViewBackward object at 0x0000022BC81E8DC8>, 0),
+            (<RepeatBackward object at 0x0000022BC81E8D08>, 0),
+            (<RepeatBackward object at 0x0000022BC81E81C8>, 0))
+            >>> # Hence, a dfs is necessary.
         """
+
+        def is_norm_grad_fn(grad_fn):
+            for fn_name in NORM:
+                if type(grad_fn).__name__.startswith(fn_name):
+                    return True
+            return False
+
+        def is_conv_grad_fn(grad_fn):
+            for fn_name in CONV:
+                if type(grad_fn).__name__.startswith(fn_name):
+                    return True
+            return False
+
+        def is_leaf_grad_fn(grad_fn):
+            if type(grad_fn).__name__ == 'AccumulateGrad':
+                return True
+            return False
+
         grad_fn = grad_fn[0] if isinstance(grad_fn, (list, tuple)) else grad_fn
         if grad_fn is not None:
-            is_bn_grad_fn = False
-            for fn_name in BN:
-                if type(grad_fn).__name__.startswith(fn_name):
-                    is_bn_grad_fn = True
-                    break
-
-            if is_bn_grad_fn:
+            if is_norm_grad_fn(grad_fn):
                 conv_grad_fn = grad_fn.next_functions[0][0]
-                conv_var = conv_grad_fn.next_functions[1][0].variable
-                bn_var = grad_fn.next_functions[1][0].variable
+                while not is_conv_grad_fn(conv_grad_fn):
+                    conv_grad_fn = conv_grad_fn.next_functions[0][0]
+
+                leaf_grad_fn = conv_grad_fn.next_functions[1][0]
+                while not is_leaf_grad_fn(leaf_grad_fn):
+                    leaf_grad_fn = leaf_grad_fn.next_functions[0][0]
+                conv_var = leaf_grad_fn.variable
+
+                leaf_grad_fn = grad_fn.next_functions[1][0]
+                while not is_leaf_grad_fn(leaf_grad_fn):
+                    leaf_grad_fn = leaf_grad_fn.next_functions[0][0]
+                bn_var = leaf_grad_fn.variable
+
                 conv_module = var2module[id(conv_var)]
                 bn_module = var2module[id(bn_var)]
                 conv_name = module2name[conv_module]
@@ -609,20 +727,20 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
                     pass
                 else:
                     visited[bn_name] = True
-                    bn_conv_links[bn_name] = conv_name
+                    norm_conv_links[bn_name] = conv_name
 
-                    self.trace_bn_conv_links(conv_grad_fn, module2name,
-                                             var2module, bn_conv_links,
-                                             visited)
+                    self.trace_norm_conv_links(conv_grad_fn, module2name,
+                                               var2module, norm_conv_links,
+                                               visited)
 
             else:
                 # If the op is AccumulateGrad, parents is (),
                 parents = grad_fn.next_functions
                 if parents is not None:
                     for parent in parents:
-                        self.trace_bn_conv_links(parent, module2name,
-                                                 var2module, bn_conv_links,
-                                                 visited)
+                        self.trace_norm_conv_links(parent, module2name,
+                                                   var2module, norm_conv_links,
+                                                   visited)
 
     def find_backward_parser(self, grad_fn):
         for name, parser in BACKWARD_PARSER_DICT.items():
@@ -632,6 +750,7 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
     @register_parser(BACKWARD_PARSER_DICT, 'ThnnConv2DBackward')
     @register_parser(BACKWARD_PARSER_DICT, 'CudnnConvolutionBackward')
     @register_parser(BACKWARD_PARSER_DICT, 'MkldnnConvolutionBackward')
+    @register_parser(BACKWARD_PARSER_DICT, 'SlowConvDilated2DBackward')
     def conv_backward_parser(self, grad_fn, module2name, var2module, cur_path,
                              result_paths, visited):
         """Parse the backward of a conv layer.
@@ -656,7 +775,12 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         name = module2name[module]
         parent = grad_fn.next_functions[0][0]
         cur_path.append(name)
-        if visited[name]:
+        # If a module is not a shared module and it has been visited during
+        # forward, its parent modules must have been traced already.
+        # However, a shared module will be visited more than once during
+        # forward, so it is still need to be traced even if it has been
+        # visited.
+        if visited[name] and name not in self.shared_module:
             result_paths.append(copy.deepcopy(cur_path))
         else:
             visited[name] = True
@@ -691,9 +815,13 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         module = var2module[var_id]
         name = module2name[module]
         parent = grad_fn.next_functions[1][0]
-
         cur_path.append(name)
-        if visited[name]:
+        # If a module is not a shared module and it has been visited during
+        # forward, its parent modules must have been traced already.
+        # However, a shared module will be visited more than once during
+        # forward, so it is still need to be traced even if it has been
+        # visited.
+        if visited[name] and name not in self.shared_module:
             result_paths.append(copy.deepcopy(cur_path))
         else:
             visited[name] = True
@@ -722,7 +850,13 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
         concat_id = '_'.join([str(id(p)) for p in parents])
         name = f'concat_{concat_id}'
         cur_path.append(name)
-        if name in visited and visited[name]:
+        # If a module is not a shared module and it has been visited during
+        # forward, its parent modules must have been traced already.
+        # However, a shared module will be visited more than once during
+        # forward, so it is still need to be traced even if it has been
+        # visited.
+        if (name in visited and visited[name]
+                and name not in self.shared_module):
             result_paths.append(copy.deepcopy(cur_path))
         else:
             visited[name] = True
@@ -733,3 +867,11 @@ class StructurePruner(BaseModule, metaclass=ABCMeta):
                 if cur_path.pop(-1) != f'{name}_item_{i}':
                     print(f'{name}_item_{i}')
         cur_path.pop(-1)
+
+    @staticmethod
+    def _reset_norm_running_stats(supernet):
+        from torch.nn.modules.batchnorm import _NormBase
+
+        for module in supernet.modules():
+            if isinstance(module, _NormBase):
+                module.reset_parameters()

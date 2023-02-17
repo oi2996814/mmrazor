@@ -22,9 +22,12 @@ student = dict(
         topk=(1, 5),
     ))
 
+checkpoint = 'https://download.openmmlab.com/mmclassification/v0/resnet/resnet50_8xb32_in1k_20210831-ea4938fc.pth'  # noqa: E501
+
 # teacher settings
 teacher = dict(
     type='mmcls.ImageClassifier',
+    init_cfg=dict(type='Pretrained', checkpoint=checkpoint),
     backbone=dict(
         type='ResNet',
         depth=34,
@@ -48,6 +51,9 @@ algorithm = dict(
         model=student,
     ),
     with_student_loss=True,
+    # teacher_trainable and with_teacher_loss have a dependency
+    # relationship, if teacher_trainable is false, then
+    # with_teacher_loss must be false.
     with_teacher_loss=False,
     distiller=dict(
         type='SingleTeacherDistiller',

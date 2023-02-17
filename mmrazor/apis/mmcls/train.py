@@ -8,20 +8,20 @@ from mmcls.core import DistOptimizerHook
 from mmcls.datasets import build_dataloader, build_dataset
 from mmcls.utils import get_root_logger
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import (HOOKS, EpochBasedRunner, Fp16OptimizerHook,
-                         build_runner)
+from mmcv.runner import EpochBasedRunner, Fp16OptimizerHook, build_runner
 from mmcv.runner.hooks import DistEvalHook, EvalHook
-from mmcv.utils import build_from_cfg
 
 # Differences from mmclassification.
 from mmrazor.core.distributed_wrapper import DistributedDataParallelWrapper
 from mmrazor.core.hooks import DistSamplerSeedHook
 from mmrazor.core.optimizer import build_optimizers
 from mmrazor.datasets.utils import split_dataset
+from mmrazor.utils import find_latest_checkpoint
 
 
 def set_random_seed(seed, deterministic=False):
-    """Set random seed.
+    """Import `set_random_seed` function here was deprecated in v0.3 and will
+    be removed in v0.5.
 
     Args:
         seed (int): Seed to be used.
@@ -30,6 +30,11 @@ def set_random_seed(seed, deterministic=False):
             to True and ``torch.backends.cudnn.benchmark`` to False.
             Default: False.
     """
+    warnings.warn(
+        'Deprecated in v0.3 and will be removed in v0.5, '
+        'please import `set_random_seed` directly from `mmrazor.apis`',
+        category=DeprecationWarning)
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -39,14 +44,14 @@ def set_random_seed(seed, deterministic=False):
         torch.backends.cudnn.benchmark = False
 
 
-def train_model(model,
-                dataset,
-                cfg,
-                distributed=False,
-                validate=False,
-                timestamp=None,
-                device='cuda',
-                meta=None):
+def train_mmcls_model(model,
+                      dataset,
+                      cfg,
+                      distributed=False,
+                      validate=False,
+                      timestamp=None,
+                      device='cuda',
+                      meta=None):
     """Copy from mmclassification and modify some codes.
 
     This is an ugly implementation, and will be deprecated in the future. In
@@ -56,9 +61,28 @@ def train_model(model,
     logger = get_root_logger()
     # Difference from mmclassification.
     # Split dataset.
-    if cfg.data.get('split', False):
+    if cfg.data.pop('split', False):
         train_dataset = dataset[0]
         dataset[0] = split_dataset(train_dataset)
+
+    loader_cfg = dict(
+        # cfg.gpus will be ignored if distributed
+        num_gpus=len(cfg.gpu_ids),
+        dist=distributed,
+        round_up=True,
+        seed=cfg.get('seed'),
+        sampler_cfg=cfg.get('sampler', None),
+    )
+    # The overall dataloader settings
+    loader_cfg.update({
+        k: v
+        for k, v in cfg.data.items() if k not in [
+            'train', 'val', 'test', 'train_dataloader', 'val_dataloader',
+            'test_dataloader'
+        ]
+    })
+    # The specific dataloader settings
+    train_loader_cfg = {**loader_cfg, **cfg.data.get('train_dataloader', {})}
 
     # Difference from mmclassification.
     # Build multi dataloaders according the splited datasets.
@@ -66,26 +90,11 @@ def train_model(model,
     for dset in dataset:
         if isinstance(dset, list):
             data_loader = [
-                build_dataloader(
-                    item_ds,
-                    cfg.data.samples_per_gpu,
-                    cfg.data.workers_per_gpu,
-                    # cfg.gpus will be ignored if distributed
-                    num_gpus=len(cfg.gpu_ids),
-                    dist=distributed,
-                    round_up=True,
-                    seed=cfg.seed) for item_ds in dset
+                build_dataloader(item_ds, **train_loader_cfg)
+                for item_ds in dset
             ]
         else:
-            data_loader = build_dataloader(
-                dset,
-                cfg.data.samples_per_gpu,
-                cfg.data.workers_per_gpu,
-                # cfg.gpus will be ignored if distributed
-                num_gpus=len(cfg.gpu_ids),
-                dist=distributed,
-                round_up=True,
-                seed=cfg.seed)
+            data_loader = build_dataloader(dset, **train_loader_cfg)
 
         data_loaders.append(data_loader)
 
@@ -115,6 +124,10 @@ def train_model(model,
             model = MMDataParallel(
                 model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
         elif device == 'cpu':
+            warnings.warn(
+                'The argument `device` is deprecated. To use cpu to train, '
+                'please refers to https://mmclassification.readthedocs.io/en'
+                '/latest/getting_started.html#train-a-model')
             model = model.cpu()
         else:
             raise ValueError(F'unsupported device name {device}.')
@@ -175,13 +188,13 @@ def train_model(model,
     # register eval hooks
     if validate:
         val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
-        val_dataloader = build_dataloader(
-            val_dataset,
-            samples_per_gpu=cfg.data.samples_per_gpu,
-            workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
-            shuffle=False,
-            round_up=True)
+        val_loader_cfg = {
+            **loader_cfg,
+            'shuffle': False,  # Not shuffle by default
+            'sampler_cfg': None,  # Not use sampler by default
+            **cfg.data.get('val_dataloader', {}),
+        }
+        val_dataloader = build_dataloader(val_dataset, **val_loader_cfg)
         eval_cfg = cfg.get('evaluation', {})
 
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
@@ -192,19 +205,11 @@ def train_model(model,
         runner.register_hook(
             eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
-    # user-defined hooks
-    if cfg.get('custom_hooks', None):
-        custom_hooks = cfg.custom_hooks
-        assert isinstance(custom_hooks, list), \
-            f'custom_hooks expect list type, but got {type(custom_hooks)}'
-        for hook_cfg in cfg.custom_hooks:
-            assert isinstance(hook_cfg, dict), \
-                'Each item in custom_hooks expects dict type, but got ' \
-                f'{type(hook_cfg)}'
-            hook_cfg = hook_cfg.copy()
-            priority = hook_cfg.pop('priority', 'NORMAL')
-            hook = build_from_cfg(hook_cfg, HOOKS)
-            runner.register_hook(hook, priority=priority)
+    resume_from = None
+    if cfg.resume_from is None and cfg.get('auto_resume'):
+        resume_from = find_latest_checkpoint(cfg.work_dir)
+    if resume_from is not None:
+        cfg.resume_from = resume_from
 
     if cfg.resume_from:
         runner.resume(cfg.resume_from)

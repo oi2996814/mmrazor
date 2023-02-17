@@ -13,6 +13,7 @@ from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
 
 from mmrazor.models.builder import build_algorithm
+from mmrazor.utils import setup_multi_processes
 
 # TODO import `wrap_fp16_model` from mmcv and delete them from mmcls
 try:
@@ -79,6 +80,12 @@ def parse_args():
         choices=['cpu', 'cuda'],
         default='cuda',
         help='device used for testing')
+    parser.add_argument(
+        '--gpu-id',
+        type=int,
+        default=0,
+        help='id of gpu to use '
+        '(only applicable to non-distributed testing)')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -91,6 +98,10 @@ def main():
     cfg = mmcv.Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+
+    # set multi-process settings
+    setup_multi_processes(cfg)
+
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -98,6 +109,8 @@ def main():
 
     assert args.metrics or args.out, \
         'Please specify at least one of output path and evaluation metrics.'
+
+    cfg.gpu_ids = [args.gpu_id]
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
@@ -107,22 +120,41 @@ def main():
         init_dist(args.launcher, **cfg.dist_params)
 
     # build the dataloader
-    dataset = build_dataset(cfg.data.test)
-    # the extra round_up data will be removed during gpu/cpu collect
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=cfg.data.samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
-        dist=distributed,
-        shuffle=False,
-        round_up=True)
+    dataset = build_dataset(cfg.data.test, default_args=dict(test_mode=True))
 
-    # build the model and load checkpoint
-    model = build_algorithm(cfg.algorithm)
+    # build the dataloader
+    # The default loader config
+    loader_cfg = dict(
+        # cfg.gpus will be ignored if distributed
+        num_gpus=len(cfg.gpu_ids),
+        dist=distributed,
+        round_up=True,
+    )
+    # The overall dataloader settings
+    loader_cfg.update({
+        k: v
+        for k, v in cfg.data.items() if k not in [
+            'train', 'val', 'test', 'train_dataloader', 'val_dataloader',
+            'test_dataloader'
+        ]
+    })
+    test_loader_cfg = {
+        **loader_cfg,
+        'shuffle': False,  # Not shuffle by default
+        'sampler_cfg': None,  # Not use sampler by default
+        **cfg.data.get('test_dataloader', {}),
+    }
+    # the extra round_up data will be removed during gpu/cpu collect
+    data_loader = build_dataloader(dataset, **test_loader_cfg)
+
+    # build the algorithm and load checkpoint
+    algorithm = build_algorithm(cfg.algorithm)
+    model = algorithm.architecture.model
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    checkpoint = load_checkpoint(
+        algorithm, args.checkpoint, map_location='cpu')
 
     if 'CLASSES' in checkpoint.get('meta', {}):
         CLASSES = checkpoint['meta']['CLASSES']
@@ -135,19 +167,19 @@ def main():
 
     if not distributed:
         if args.device == 'cpu':
-            model = model.cpu()
+            algorithm = algorithm.cpu()
         else:
-            model = MMDataParallel(model, device_ids=[0])
+            algorithm = MMDataParallel(algorithm, device_ids=cfg.gpu_ids)
         model.CLASSES = CLASSES
         show_kwargs = {} if args.show_options is None else args.show_options
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir,
-                                  **show_kwargs)
+        outputs = single_gpu_test(algorithm, data_loader, args.show,
+                                  args.show_dir, **show_kwargs)
     else:
-        model = MMDistributedDataParallel(
-            model.cuda(),
+        algorithm = MMDistributedDataParallel(
+            algorithm.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
+        outputs = multi_gpu_test(algorithm, data_loader, args.tmpdir,
                                  args.gpu_collect)
 
     rank, _ = get_dist_info()

@@ -101,7 +101,7 @@ class BaseDistiller(BaseModule, metaclass=ABCMeta):
     For python function's outputs, obtained by a specific context manager.
 
     Args:
-        align_functions (dict): The details of the functions which outputs need
+        align_methods (dict): The details of the functions which outputs need
         to be obtained.
     """
 
@@ -120,7 +120,7 @@ class BaseDistiller(BaseModule, metaclass=ABCMeta):
             self.context_manager = ConversionContext(align_methods)
 
     @abstractmethod
-    def prepare_from_student(self, supernet):
+    def prepare_from_student(self, student):
         """Register forward hooks to students and teachers."""
         pass
 

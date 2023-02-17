@@ -56,6 +56,11 @@ class EvolutionSearcher():
 
         if not hasattr(algorithm, 'module'):
             raise NotImplementedError('Do not support searching with cpu.')
+        if num_mutation + num_crossover > candidate_pool_size:
+            raise ValueError(
+                f'The sum of num_mutation({num_mutation}) and '
+                f'num_crossover({num_crossover}) should not be '
+                f'greater than candidate_pool_size({candidate_pool_size}).')
         self.algorithm = algorithm.module
         self.algorithm_for_test = algorithm
         self.dataloader = dataloader
@@ -135,14 +140,11 @@ class EvolutionSearcher():
 
                     if self.check_constraints():
                         self.candidate_pool.append(candidate)
-
-                broadcast_candidate_pool = self.candidate_pool
             else:
-                broadcast_candidate_pool = [None] * self.candidate_pool_size
-            broadcast_candidate_pool = broadcast_object_list(
-                broadcast_candidate_pool)
+                self.candidate_pool = [None] * self.candidate_pool_size
+            broadcast_object_list(self.candidate_pool)
 
-            for i, candidate in enumerate(broadcast_candidate_pool):
+            for i, candidate in enumerate(self.candidate_pool):
                 self.algorithm.mutator.set_subnet(candidate)
                 outputs = self.test_fn(self.algorithm_for_test,
                                        self.dataloader)
@@ -213,7 +215,6 @@ class EvolutionSearcher():
                 self.logger.info(
                     f'Epoch:[{epoch + 1}/{self.max_epoch}], top1_score: '
                     f'{list(self.top_k_candidates_with_score.keys())[0]}')
-            self.candidate_pool = broadcast_object_list(self.candidate_pool)
 
         if rank == 0:
             final_subnet_dict = list(
